@@ -1,0 +1,543 @@
+require('dotenv').config();
+
+const fs = require('node:fs');
+const path = require('node:path');
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  PermissionFlagsBits,
+} = require('discord.js');
+
+// ============================================================
+// كل الآيديات والإعدادات هنا فقط - غيّر الأرقام ولا تغيّر الأسماء
+// ============================================================
+const CONFIG = {
+  GUILD_ID: 'PUT_GUILD_ID',
+  SERVER_NAME: 'Ghost',
+
+  // صور مباشرة بصيغة PNG/JPG/WebP. اتركها فارغة لاستخدام بانر السيرفر.
+  SERVER_BANNER_URL: '',
+
+  CHANNELS: {
+    WELCOME: 'PUT_WELCOME_CHANNEL_ID',
+    RULES: 'PUT_RULES_CHANNEL_ID',
+    APPLY: 'PUT_APPLY_CHANNEL_ID',
+    APPLICATION_RESULTS: 'PUT_APPLICATION_RESULTS_CHANNEL_ID',
+    VOICE_PANEL: 'PUT_VOICE_PANEL_CHANNEL_ID',
+    VOICE_REVIEW: 'PUT_VOICE_REVIEW_CHANNEL_ID',
+    CONTROL: 'PUT_CONTROL_CHANNEL_ID',
+    INTERVIEW_WAITING: 'PUT_INTERVIEW_WAITING_CHANNEL_ID',
+  },
+
+  ROLES: {
+    AUTO_MEMBER: 'PUT_AUTO_MEMBER_ROLE_ID',
+    APPLICATION_REVIEWER: 'PUT_APPLICATION_REVIEWER_ROLE_ID',
+    TEXT_ACCEPTED: 'PUT_TEXT_ACCEPTED_ROLE_ID',
+    ENTRY_PERMIT: 'PUT_ENTRY_PERMIT_ROLE_ID',
+  },
+
+  // هذه الرولات فقط تستطيع استخدام الكنترول والقبول والرفض.
+  STAFF_ROLE_IDS: [
+    'PUT_STAFF_ROLE_ID',
+  ],
+
+  // تستطيع إضافة أو حذف الأسئلة كما تريد.
+  APPLICATION_QUESTIONS: [
+    'ما اسمك؟',
+    'كم عمرك؟',
+    'ما اسمك داخل الرول بلاي؟',
+    'كم عدد ساعات لعبك في FiveM؟',
+    'هل سبق أن كنت إداريًا؟ اذكر خبرتك.',
+    'لماذا تريد الانضمام إلى إدارة Ghost؟',
+    'كم ساعة تستطيع التواجد يوميًا؟',
+    'ماذا تفعل إذا رأيت إداريًا يخالف القوانين؟',
+  ],
+
+  DEFAULT_CLOSED_MESSAGE: 'التقديم مغلق حاليًا، وسيتم الإعلان عند فتحه مرة أخرى.',
+  COLORS: {
+    MAIN: 0x1677ff,
+    SUCCESS: 0x22c55e,
+    DANGER: 0xef4444,
+    WARNING: 0xf59e0b,
+  },
+};
+
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
+const DEFAULT_DATA = {
+  applicationsOpen: true,
+  closedMessage: CONFIG.DEFAULT_CLOSED_MESSAGE,
+  activeApplicants: [],
+};
+
+function loadData() {
+  try {
+    return { ...DEFAULT_DATA, ...JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) };
+  } catch {
+    return { ...DEFAULT_DATA };
+  }
+}
+
+let data = loadData();
+
+function saveData() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+}
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+  partials: [Partials.Channel, Partials.Message, Partials.User],
+});
+
+function isConfigured(value) {
+  return value && !String(value).startsWith('PUT_');
+}
+
+function channelUrl(channelId) {
+  return `https://discord.com/channels/${CONFIG.GUILD_ID}/${channelId}`;
+}
+
+function bannerFor(guild) {
+  return CONFIG.SERVER_BANNER_URL || guild.bannerURL({ size: 2048 }) || null;
+}
+
+function panelEmbed(title, description, color = CONFIG.COLORS.MAIN) {
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle(title)
+    .setDescription(description)
+    .setFooter({ text: `${CONFIG.SERVER_NAME} • جميع الحقوق محفوظة` })
+    .setTimestamp();
+}
+
+function staffOnly(member) {
+  if (!member) return false;
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  return CONFIG.STAFF_ROLE_IDS.some(id => member.roles.cache.has(id));
+}
+
+function reviewerMention() {
+  return isConfigured(CONFIG.ROLES.APPLICATION_REVIEWER)
+    ? `<@&${CONFIG.ROLES.APPLICATION_REVIEWER}>`
+    : '';
+}
+
+function reviewButtons(prefix, applicantId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${prefix}_accept:${applicantId}`)
+      .setLabel('قبول')
+      .setEmoji('✅')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`${prefix}_reject:${applicantId}`)
+      .setLabel('رفض بسبب')
+      .setEmoji('❌')
+      .setStyle(ButtonStyle.Danger),
+  );
+}
+
+function disableRows(message) {
+  return message.components.map(row => {
+    const newRow = ActionRowBuilder.from(row);
+    newRow.components = newRow.components.map(button => ButtonBuilder.from(button).setDisabled(true));
+    return newRow;
+  });
+}
+
+async function safeDM(user, payload) {
+  try {
+    await user.send(payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function sendWelcome(member) {
+  const channel = member.guild.channels.cache.get(CONFIG.CHANNELS.WELCOME);
+  if (!channel?.isTextBased()) return;
+
+  const embed = new EmbedBuilder()
+    .setColor(CONFIG.COLORS.MAIN)
+    .setAuthor({ name: `مرحبًا بك في ${CONFIG.SERVER_NAME}`, iconURL: member.user.displayAvatarURL() })
+    .setTitle(`أهلًا ${member.user.username} 👋`)
+    .setDescription(`نورت **${CONFIG.SERVER_NAME}** يا ${member}. اقرأ القوانين ثم توجّه إلى التقديم، ونتمنى لك وقتًا ممتعًا معنا.`)
+    .setThumbnail(member.user.displayAvatarURL({ size: 512 }))
+    .setImage(bannerFor(member.guild))
+    .setFooter({ text: `العضو رقم ${member.guild.memberCount}` })
+    .setTimestamp();
+
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setLabel('القوانين').setEmoji('📜').setStyle(ButtonStyle.Link).setURL(channelUrl(CONFIG.CHANNELS.RULES)),
+    new ButtonBuilder().setLabel('التقديم').setEmoji('📝').setStyle(ButtonStyle.Link).setURL(channelUrl(CONFIG.CHANNELS.APPLY)),
+  );
+
+  await channel.send({ content: `${member}`, embeds: [embed], components: [buttons] });
+}
+
+async function startApplication(interaction) {
+  if (!data.applicationsOpen) {
+    return interaction.reply({
+      embeds: [panelEmbed('التقديم مغلق', data.closedMessage, CONFIG.COLORS.WARNING)],
+      ephemeral: true,
+    });
+  }
+
+  if (data.activeApplicants.includes(interaction.user.id)) {
+    return interaction.reply({ content: 'لديك تقديم جارٍ بالفعل في الخاص.', ephemeral: true });
+  }
+
+  const member = interaction.member;
+  if (isConfigured(CONFIG.ROLES.TEXT_ACCEPTED) && member.roles.cache.has(CONFIG.ROLES.TEXT_ACCEPTED)) {
+    return interaction.reply({ content: 'تم قبولك في التقديم الكتابي بالفعل. توجّه إلى مرحلة التقديم الصوتي.', ephemeral: true });
+  }
+
+  const dm = await safeDM(interaction.user, {
+    embeds: [panelEmbed(
+      `تقديم إدارة ${CONFIG.SERVER_NAME}`,
+      'سيتم إرسال الأسئلة واحدًا تلو الآخر. لديك **5 دقائق** للإجابة عن كل سؤال. اكتب `إلغاء` في أي وقت لإيقاف التقديم.'
+    )],
+  });
+
+  if (!dm) {
+    return interaction.reply({ content: 'تعذر فتح الخاص. فعّل استقبال الرسائل الخاصة من أعضاء السيرفر ثم حاول مجددًا.', ephemeral: true });
+  }
+
+  await interaction.reply({ content: 'تم إرسال التقديم لك في الخاص 📩', ephemeral: true });
+  data.activeApplicants.push(interaction.user.id);
+  saveData();
+
+  const answers = [];
+  const dmChannel = await interaction.user.createDM();
+
+  try {
+    for (let index = 0; index < CONFIG.APPLICATION_QUESTIONS.length; index++) {
+      const question = CONFIG.APPLICATION_QUESTIONS[index];
+      await dmChannel.send({
+        embeds: [panelEmbed(
+          `السؤال ${index + 1} من ${CONFIG.APPLICATION_QUESTIONS.length}`,
+          question
+        )],
+      });
+
+      const collected = await dmChannel.awaitMessages({
+        filter: message => message.author.id === interaction.user.id,
+        max: 1,
+        time: 5 * 60 * 1000,
+        errors: ['time'],
+      });
+
+      const answer = collected.first().content.trim();
+      if (answer === 'إلغاء') throw new Error('CANCELLED');
+      answers.push(answer.slice(0, 1500));
+    }
+
+    const resultChannel = await client.channels.fetch(CONFIG.CHANNELS.APPLICATION_RESULTS);
+    if (!resultChannel?.isTextBased()) throw new Error('RESULT_CHANNEL');
+
+    const fields = answers.map((answer, index) => ({
+      name: `${index + 1}) ${CONFIG.APPLICATION_QUESTIONS[index]}`.slice(0, 256),
+      value: answer || 'بدون إجابة',
+    }));
+
+    const chunks = [];
+    for (let i = 0; i < fields.length; i += 5) chunks.push(fields.slice(i, i + 5));
+
+    const embeds = chunks.map((chunk, index) => new EmbedBuilder()
+      .setColor(CONFIG.COLORS.MAIN)
+      .setTitle(index === 0 ? `تقديم جديد • ${interaction.user.username}` : `تكملة التقديم • ${interaction.user.username}`)
+      .setDescription(index === 0 ? `المتقدم: ${interaction.user}\nالآيدي: \`${interaction.user.id}\`` : null)
+      .addFields(chunk)
+      .setThumbnail(interaction.user.displayAvatarURL({ size: 256 }))
+      .setTimestamp());
+
+    await resultChannel.send({
+      content: `${reviewerMention()} تقديم من ${interaction.user}`.trim(),
+      embeds,
+      components: [reviewButtons('app', interaction.user.id)],
+      allowedMentions: { roles: isConfigured(CONFIG.ROLES.APPLICATION_REVIEWER) ? [CONFIG.ROLES.APPLICATION_REVIEWER] : [] },
+    });
+
+    await dmChannel.send({
+      embeds: [panelEmbed('تم استلام تقديمك', 'تقديمك الآن قيد المراجعة. سيتم إرسال النتيجة لك هنا عند اتخاذ القرار.', CONFIG.COLORS.SUCCESS)],
+    });
+  } catch (error) {
+    if (error.message === 'CANCELLED') {
+      await safeDM(interaction.user, 'تم إلغاء التقديم.');
+    } else if (error.message === 'RESULT_CHANNEL') {
+      await safeDM(interaction.user, 'حدث خطأ في روم استلام التقديمات. تواصل مع الإدارة.');
+    } else {
+      await safeDM(interaction.user, 'انتهى الوقت المسموح للإجابة. يمكنك بدء تقديم جديد من البانل.');
+    }
+  } finally {
+    data.activeApplicants = data.activeApplicants.filter(id => id !== interaction.user.id);
+    saveData();
+  }
+}
+
+async function acceptWritten(interaction, applicantId) {
+  const guild = interaction.guild;
+  const member = await guild.members.fetch(applicantId).catch(() => null);
+  if (!member) return interaction.reply({ content: 'العضو غير موجود في السيرفر.', ephemeral: true });
+
+  if (isConfigured(CONFIG.ROLES.TEXT_ACCEPTED)) {
+    await member.roles.add(CONFIG.ROLES.TEXT_ACCEPTED, `قبول التقديم بواسطة ${interaction.user.tag}`);
+  }
+
+  await interaction.update({ components: disableRows(interaction.message) });
+  await interaction.followUp({ content: `تم قبول ${member} في التقديم الكتابي بواسطة ${interaction.user}.`, ephemeral: false });
+  await safeDM(member.user, {
+    embeds: [panelEmbed(
+      'تم قبول تقديمك الكتابي ✅',
+      `مبروك! تم قبولك مبدئيًا في إدارة **${CONFIG.SERVER_NAME}**. بقيت لك المقابلة الصوتية؛ توجّه إلى <#${CONFIG.CHANNELS.INTERVIEW_WAITING}> وانتظر تعليمات الإدارة.`,
+      CONFIG.COLORS.SUCCESS
+    )],
+  });
+}
+
+function rejectModal(prefix, applicantId) {
+  return new ModalBuilder()
+    .setCustomId(`${prefix}_reject_modal:${applicantId}`)
+    .setTitle('سبب الرفض')
+    .addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId('reason')
+        .setLabel('اكتب سبب الرفض بوضوح')
+        .setStyle(TextInputStyle.Paragraph)
+        .setMinLength(3)
+        .setMaxLength(1000)
+        .setRequired(true)
+    ));
+}
+
+async function finishReject(interaction, applicantId, stage) {
+  const reason = interaction.fields.getTextInputValue('reason');
+  const member = await interaction.guild.members.fetch(applicantId).catch(() => null);
+  const user = member?.user || await client.users.fetch(applicantId).catch(() => null);
+
+  const title = stage === 'voice' ? 'نتيجة المقابلة الصوتية' : 'نتيجة التقديم الإداري';
+  if (user) {
+    await safeDM(user, {
+      embeds: [panelEmbed(
+        `${title} ❌`,
+        `نأسف، لم يتم قبولك في هذه المرحلة.\n\n**السبب:**\n${reason}\n\nنتمنى لك التوفيق.`,
+        CONFIG.COLORS.DANGER
+      )],
+    });
+  }
+
+  await interaction.reply({ content: `تم رفض <@${applicantId}> وإرسال السبب في الخاص.\n**السبب:** ${reason}` });
+
+  if (interaction.message) {
+    await interaction.message.edit({ components: disableRows(interaction.message) }).catch(() => {});
+  }
+}
+
+async function submitVoice(interaction) {
+  if (isConfigured(CONFIG.ROLES.TEXT_ACCEPTED) && !interaction.member.roles.cache.has(CONFIG.ROLES.TEXT_ACCEPTED)) {
+    return interaction.reply({ content: 'يجب قبولك في التقديم الكتابي أولًا.', ephemeral: true });
+  }
+
+  if (isConfigured(CONFIG.ROLES.ENTRY_PERMIT) && interaction.member.roles.cache.has(CONFIG.ROLES.ENTRY_PERMIT)) {
+    return interaction.reply({ content: 'لديك تصريح الدخول بالفعل.', ephemeral: true });
+  }
+
+  const channel = await client.channels.fetch(CONFIG.CHANNELS.VOICE_REVIEW).catch(() => null);
+  if (!channel?.isTextBased()) return interaction.reply({ content: 'روم مراجعة الصوتي غير مضبوط.', ephemeral: true });
+
+  const embed = panelEmbed(
+    'طلب مراجعة المقابلة الصوتية',
+    `المتقدم: ${interaction.user}\nالآيدي: \`${interaction.user.id}\`\n\nيرجى إجراء المقابلة ثم اختيار القبول أو الرفض مع السبب.`
+  ).setThumbnail(interaction.user.displayAvatarURL({ size: 256 }));
+
+  await channel.send({
+    content: reviewerMention(),
+    embeds: [embed],
+    components: [reviewButtons('voice', interaction.user.id)],
+    allowedMentions: { roles: isConfigured(CONFIG.ROLES.APPLICATION_REVIEWER) ? [CONFIG.ROLES.APPLICATION_REVIEWER] : [] },
+  });
+
+  await interaction.reply({
+    embeds: [panelEmbed('المقابلة الصوتية قيد المراجعة', 'تم إرسال طلبك للإدارة. ستصلك النتيجة في الخاص فور الانتهاء من المراجعة.', CONFIG.COLORS.WARNING)],
+    ephemeral: true,
+  });
+}
+
+async function acceptVoice(interaction, applicantId) {
+  const member = await interaction.guild.members.fetch(applicantId).catch(() => null);
+  if (!member) return interaction.reply({ content: 'العضو غير موجود في السيرفر.', ephemeral: true });
+
+  if (isConfigured(CONFIG.ROLES.ENTRY_PERMIT)) {
+    await member.roles.add(CONFIG.ROLES.ENTRY_PERMIT, `اجتاز المقابلة الصوتية بواسطة ${interaction.user.tag}`);
+  }
+
+  await interaction.update({ components: disableRows(interaction.message) });
+  await interaction.followUp({ content: `تم قبول ${member} في المقابلة الصوتية ومنحه تصريح الدخول.` });
+  await safeDM(member.user, {
+    embeds: [panelEmbed(
+      'تم قبولك في المقابلة الصوتية ✅',
+      `مبروك! اجتزت جميع مراحل التقديم في **${CONFIG.SERVER_NAME}** وتم منحك **رول تصريح الدخول**. نتمنى لك التوفيق معنا.`,
+      CONFIG.COLORS.SUCCESS
+    )],
+  });
+}
+
+function controlRows() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('control_open').setLabel('فتح التقديم').setEmoji('🔓').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('control_close').setLabel('قفل التقديم').setEmoji('🔒').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('control_message').setLabel('تعديل رسالة الإغلاق').setEmoji('✏️').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('control_status').setLabel('الحالة').setEmoji('📊').setStyle(ButtonStyle.Primary),
+    ),
+  ];
+}
+
+async function sendPanels() {
+  const apply = await client.channels.fetch(CONFIG.CHANNELS.APPLY).catch(() => null);
+  if (apply?.isTextBased()) {
+    await apply.send({
+      embeds: [panelEmbed(
+        `التقديم على إدارة ${CONFIG.SERVER_NAME}`,
+        'اضغط الزر أدناه لبدء التقديم. ستصلك الأسئلة في الخاص سؤالًا بعد سؤال، وبعد الانتهاء يتم إرسال تقديمك إلى لجنة المراجعة.'
+      )],
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('start_application').setLabel('بدء التقديم').setEmoji('📝').setStyle(ButtonStyle.Primary)
+      )],
+    });
+  }
+
+  const voice = await client.channels.fetch(CONFIG.CHANNELS.VOICE_PANEL).catch(() => null);
+  if (voice?.isTextBased()) {
+    await voice.send({
+      embeds: [panelEmbed(
+        'مرحلة المقابلة الصوتية',
+        'هذه المرحلة مخصصة لمن تم قبولهم في التقديم الكتابي. اضغط الزر لإبلاغ الإدارة بأنك جاهز للمراجعة الصوتية.'
+      )],
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('submit_voice').setLabel('إرسال للمراجعة الصوتية').setEmoji('🎙️').setStyle(ButtonStyle.Primary)
+      )],
+    });
+  }
+
+  const control = await client.channels.fetch(CONFIG.CHANNELS.CONTROL).catch(() => null);
+  if (control?.isTextBased()) {
+    await control.send({
+      embeds: [panelEmbed('كنترول التقديم', 'من هنا تستطيع فتح أو قفل التقديم وتحديد الرسالة التي تظهر للأعضاء عند الإغلاق.')],
+      components: controlRows(),
+    });
+  }
+}
+
+client.once('ready', () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  client.user.setActivity(`${CONFIG.SERVER_NAME} Applications`);
+});
+
+client.on('guildMemberAdd', async member => {
+  try {
+    if (isConfigured(CONFIG.ROLES.AUTO_MEMBER)) await member.roles.add(CONFIG.ROLES.AUTO_MEMBER);
+    await sendWelcome(member);
+  } catch (error) {
+    console.error('Welcome error:', error);
+  }
+});
+
+client.on('interactionCreate', async interaction => {
+  try {
+    if (interaction.isButton()) {
+      const [action, applicantId] = interaction.customId.split(':');
+
+      if (action === 'start_application') return startApplication(interaction);
+      if (action === 'submit_voice') return submitVoice(interaction);
+
+      if (action.startsWith('app_') || action.startsWith('voice_') || action.startsWith('control_')) {
+        if (!staffOnly(interaction.member)) return interaction.reply({ content: 'ليس لديك صلاحية لاستخدام هذا الزر.', ephemeral: true });
+      }
+
+      if (action === 'app_accept') return acceptWritten(interaction, applicantId);
+      if (action === 'app_reject') return interaction.showModal(rejectModal('app', applicantId));
+      if (action === 'voice_accept') return acceptVoice(interaction, applicantId);
+      if (action === 'voice_reject') return interaction.showModal(rejectModal('voice', applicantId));
+
+      if (action === 'control_open') {
+        data.applicationsOpen = true;
+        saveData();
+        return interaction.reply({ content: 'تم فتح التقديم بنجاح 🔓', ephemeral: true });
+      }
+      if (action === 'control_close') {
+        data.applicationsOpen = false;
+        saveData();
+        return interaction.reply({ content: `تم قفل التقديم 🔒\nالرسالة الحالية: ${data.closedMessage}`, ephemeral: true });
+      }
+      if (action === 'control_status') {
+        return interaction.reply({
+          content: `حالة التقديم: **${data.applicationsOpen ? 'مفتوح 🔓' : 'مغلق 🔒'}**\nرسالة الإغلاق: ${data.closedMessage}`,
+          ephemeral: true,
+        });
+      }
+      if (action === 'control_message') {
+        const modal = new ModalBuilder().setCustomId('closed_message_modal').setTitle('رسالة قفل التقديم');
+        const input = new TextInputBuilder()
+          .setCustomId('message')
+          .setLabel('الرسالة التي ستظهر للأعضاء')
+          .setStyle(TextInputStyle.Paragraph)
+          .setValue(data.closedMessage.slice(0, 1000))
+          .setMaxLength(1000)
+          .setRequired(true);
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        return interaction.showModal(modal);
+      }
+    }
+
+    if (interaction.isModalSubmit()) {
+      const [action, applicantId] = interaction.customId.split(':');
+      if (!staffOnly(interaction.member)) return interaction.reply({ content: 'ليس لديك صلاحية.', ephemeral: true });
+      if (action === 'app_reject_modal') return finishReject(interaction, applicantId, 'app');
+      if (action === 'voice_reject_modal') return finishReject(interaction, applicantId, 'voice');
+      if (action === 'closed_message_modal') {
+        data.closedMessage = interaction.fields.getTextInputValue('message');
+        saveData();
+        return interaction.reply({ content: `تم حفظ رسالة الإغلاق الجديدة:\n${data.closedMessage}`, ephemeral: true });
+      }
+    }
+  } catch (error) {
+    console.error('Interaction error:', error);
+    const payload = { content: 'حدث خطأ غير متوقع. تأكد من الآيديات وصلاحيات البوت.', ephemeral: true };
+    if (interaction.deferred || interaction.replied) await interaction.followUp(payload).catch(() => {});
+    else await interaction.reply(payload).catch(() => {});
+  }
+});
+
+client.on('messageCreate', async message => {
+  if (message.author.bot || !message.guild) return;
+  if (message.content === '!panels') {
+    if (!staffOnly(message.member)) return;
+    await sendPanels();
+    await message.reply('تم إرسال بانلات التقديم والصوتي والكنترول في الرومات المحددة.');
+  }
+});
+
+process.on('unhandledRejection', error => console.error('Unhandled rejection:', error));
+process.on('uncaughtException', error => console.error('Uncaught exception:', error));
+
+if (!process.env.DISCORD_TOKEN) {
+  console.error('Missing DISCORD_TOKEN. Add it to Railway Variables.');
+  process.exit(1);
+}
+
+client.login(process.env.DISCORD_TOKEN);
