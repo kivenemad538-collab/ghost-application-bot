@@ -349,32 +349,72 @@ async function finishReject(interaction, applicantId, stage) {
   }
 }
 
-async function submitVoice(interaction) {
-  if (isConfigured(CONFIG.ROLES.TEXT_ACCEPTED) && !interaction.member.roles.cache.has(CONFIG.ROLES.TEXT_ACCEPTED)) {
-    return interaction.reply({ content: 'يجب قبولك في التقديم الكتابي أولًا.', ephemeral: true });
+function voiceApplicantIdModal() {
+  return new ModalBuilder()
+    .setCustomId('voice_applicant_id_modal')
+    .setTitle('إضافة تقديم صوتي')
+    .addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId('applicant_id')
+        .setLabel('اكتب آيدي الشخص')
+        .setPlaceholder('مثال: 123456789012345678')
+        .setStyle(TextInputStyle.Short)
+        .setMinLength(17)
+        .setMaxLength(20)
+        .setRequired(true)
+    ));
+}
+
+async function registerVoiceById(interaction) {
+  const applicantId = interaction.fields.getTextInputValue('applicant_id').trim();
+
+  if (!/^\d{17,20}$/.test(applicantId)) {
+    return interaction.reply({ content: 'الآيدي غير صحيح. اكتب آيدي ديسكورد أرقام فقط.', ephemeral: true });
   }
 
-  if (isConfigured(CONFIG.ROLES.ENTRY_PERMIT) && interaction.member.roles.cache.has(CONFIG.ROLES.ENTRY_PERMIT)) {
-    return interaction.reply({ content: 'لديك تصريح الدخول بالفعل.', ephemeral: true });
+  const member = await interaction.guild.members.fetch(applicantId).catch(() => null);
+  if (!member) {
+    return interaction.reply({ content: 'لم أجد هذا الشخص داخل السيرفر. تأكد من الآيدي.', ephemeral: true });
   }
 
-  const channel = await client.channels.fetch(CONFIG.CHANNELS.VOICE_REVIEW).catch(() => null);
-  if (!channel?.isTextBased()) return interaction.reply({ content: 'روم مراجعة الصوتي غير مضبوط.', ephemeral: true });
+  if (member.user.bot) {
+    return interaction.reply({ content: 'لا يمكن تسجيل بوت في المقابلة الصوتية.', ephemeral: true });
+  }
 
-  const embed = panelEmbed(
-    'طلب مراجعة المقابلة الصوتية',
-    `المتقدم: ${interaction.user}\nالآيدي: \`${interaction.user.id}\`\n\nيرجى إجراء المقابلة ثم اختيار القبول أو الرفض مع السبب.`
-  ).setThumbnail(interaction.user.displayAvatarURL({ size: 256 }));
+  if (isConfigured(CONFIG.ROLES.ENTRY_PERMIT) && member.roles.cache.has(CONFIG.ROLES.ENTRY_PERMIT)) {
+    return interaction.reply({ content: 'هذا الشخص لديه رول تصريح الدخول بالفعل.', ephemeral: true });
+  }
 
-  await channel.send({
-    content: reviewerMention(),
-    embeds: [embed],
-    components: [reviewButtons('voice', interaction.user.id)],
-    allowedMentions: { roles: isConfigured(CONFIG.ROLES.APPLICATION_REVIEWER) ? [CONFIG.ROLES.APPLICATION_REVIEWER] : [] },
+  const reviewChannel = await client.channels.fetch(CONFIG.CHANNELS.VOICE_REVIEW).catch(() => null);
+  if (!reviewChannel?.isTextBased()) {
+    return interaction.reply({ content: 'روم مراجعة التقديم الصوتي غير مضبوط.', ephemeral: true });
+  }
+
+  const dmSent = await safeDM(member.user, {
+    embeds: [panelEmbed(
+      'تقديمك الصوتي قيد المراجعة 🎙️',
+      `تم تسجيل تقديمك في مرحلة المقابلة الصوتية لإدارة **${CONFIG.SERVER_NAME}**، وهو الآن قيد المراجعة. ستصلك النتيجة هنا في الخاص سواء بالقبول أو الرفض مع السبب.`,
+      CONFIG.COLORS.WARNING
+    )],
   });
 
-  await interaction.reply({
-    embeds: [panelEmbed('المقابلة الصوتية قيد المراجعة', 'تم إرسال طلبك للإدارة. ستصلك النتيجة في الخاص فور الانتهاء من المراجعة.', CONFIG.COLORS.WARNING)],
+  const embed = panelEmbed(
+    'تقديم صوتي جديد',
+    `المتقدم: ${member}\nالاسم: **${member.user.username}**\nالآيدي: \`${member.id}\`\nسجله للمراجعة: ${interaction.user}\n\nاختَر القبول لمنحه تصريح الدخول، أو الرفض واكتب السبب.`
+  ).setThumbnail(member.user.displayAvatarURL({ size: 256 }));
+
+  await reviewChannel.send({
+    content: `${reviewerMention()} تقديم صوتي من ${member}`.trim(),
+    embeds: [embed],
+    components: [reviewButtons('voice', member.id)],
+    allowedMentions: {
+      roles: isConfigured(CONFIG.ROLES.APPLICATION_REVIEWER) ? [CONFIG.ROLES.APPLICATION_REVIEWER] : [],
+      users: [member.id],
+    },
+  });
+
+  return interaction.reply({
+    content: `تم تسجيل التقديم الصوتي لـ ${member} وإرساله إلى روم المراجعة.${dmSent ? '\nتم إبلاغه في الخاص.' : '\nتعذر إرسال الخاص له لأن رسائله مغلقة.'}`,
     ephemeral: true,
   });
 }
@@ -427,11 +467,11 @@ async function sendPanels() {
   if (voice?.isTextBased()) {
     await voice.send({
       embeds: [panelEmbed(
-        'مرحلة المقابلة الصوتية',
-        'هذه المرحلة مخصصة لمن تم قبولهم في التقديم الكتابي. اضغط الزر لإبلاغ الإدارة بأنك جاهز للمراجعة الصوتية.'
+        'كنترول المقابلة الصوتية',
+        'هذا البانل مخصص للإدارة. اضغط الزر، ثم اكتب آيدي الشخص الذي قدّم صوتي. سيتم إبلاغه في الخاص وإرسال طلبه إلى روم المراجعة للقبول أو الرفض بسبب.'
       )],
       components: [new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('submit_voice').setLabel('إرسال للمراجعة الصوتية').setEmoji('🎙️').setStyle(ButtonStyle.Primary)
+        new ButtonBuilder().setCustomId('add_voice_applicant').setLabel('كتابة آيدي المتقدم').setEmoji('🎙️').setStyle(ButtonStyle.Primary)
       )],
     });
   }
@@ -465,7 +505,13 @@ client.on('interactionCreate', async interaction => {
       const [action, applicantId] = interaction.customId.split(':');
 
       if (action === 'start_application') return startApplication(interaction);
-      if (action === 'submit_voice') return submitVoice(interaction);
+
+      if (action === 'add_voice_applicant') {
+        if (!staffOnly(interaction.member)) {
+          return interaction.reply({ content: 'هذا البانل مخصص للإدارة فقط.', ephemeral: true });
+        }
+        return interaction.showModal(voiceApplicantIdModal());
+      }
 
       if (action.startsWith('app_') || action.startsWith('voice_') || action.startsWith('control_')) {
         if (!staffOnly(interaction.member)) return interaction.reply({ content: 'ليس لديك صلاحية لاستخدام هذا الزر.', ephemeral: true });
@@ -511,6 +557,7 @@ client.on('interactionCreate', async interaction => {
       if (!staffOnly(interaction.member)) return interaction.reply({ content: 'ليس لديك صلاحية.', ephemeral: true });
       if (action === 'app_reject_modal') return finishReject(interaction, applicantId, 'app');
       if (action === 'voice_reject_modal') return finishReject(interaction, applicantId, 'voice');
+      if (action === 'voice_applicant_id_modal') return registerVoiceById(interaction);
       if (action === 'closed_message_modal') {
         data.closedMessage = interaction.fields.getTextInputValue('message');
         saveData();
