@@ -32,7 +32,7 @@ const CONFIG = {
     APPLY: '1535785755090223105',
     APPLICATION_RESULTS: '1543742366433935500',
     VOICE_PANEL: '1543742818822914108',
-    VOICE_REVIEW: '1536347609164161034',
+    VOICE_REVIEW: '1543742366433935500',
     CONTROL: '1536347609164161034',
     INTERVIEW_WAITING: '1535785755090223105',
   },
@@ -77,6 +77,8 @@ const DEFAULT_DATA = {
   applicationsOpen: true,
   closedMessage: CONFIG.DEFAULT_CLOSED_MESSAGE,
   activeApplicants: [],
+  pendingApplications: [],
+  pendingVoiceApplicants: [],
 };
 
 function loadData() {
@@ -88,6 +90,10 @@ function loadData() {
 }
 
 let data = loadData();
+data.activeApplicants = Array.isArray(data.activeApplicants) ? data.activeApplicants : [];
+data.pendingApplications = Array.isArray(data.pendingApplications) ? data.pendingApplications : [];
+data.pendingVoiceApplicants = Array.isArray(data.pendingVoiceApplicants) ? data.pendingVoiceApplicants : [];
+const processingReviews = new Set();
 
 function saveData() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
@@ -203,10 +209,16 @@ async function startApplication(interaction) {
     return interaction.reply({ content: 'لديك تقديم جارٍ بالفعل في الخاص.', ephemeral: true });
   }
 
+  if (data.pendingApplications.includes(interaction.user.id)) {
+    return interaction.reply({ content: 'تقديمك الإداري موجود بالفعل وقيد المراجعة.', ephemeral: true });
+  }
+
   const member = interaction.member;
   if (isConfigured(CONFIG.ROLES.TEXT_ACCEPTED) && member.roles.cache.has(CONFIG.ROLES.TEXT_ACCEPTED)) {
     return interaction.reply({ content: 'تم قبولك في التقديم الكتابي بالفعل. توجّه إلى مرحلة التقديم الصوتي.', ephemeral: true });
   }
+
+  await interaction.deferReply({ ephemeral: true });
 
   const dm = await safeDM(interaction.user, {
     embeds: [panelEmbed(
@@ -216,10 +228,10 @@ async function startApplication(interaction) {
   });
 
   if (!dm) {
-    return interaction.reply({ content: 'تعذر فتح الخاص. فعّل استقبال الرسائل الخاصة من أعضاء السيرفر ثم حاول مجددًا.', ephemeral: true });
+    return interaction.editReply({ content: 'تعذر فتح الخاص. فعّل استقبال الرسائل الخاصة من أعضاء السيرفر ثم حاول مجددًا.' });
   }
 
-  await interaction.reply({ content: 'تم إرسال التقديم لك في الخاص 📩', ephemeral: true });
+  await interaction.editReply({ content: 'تم إرسال التقديم لك في الخاص 📩' });
   data.activeApplicants.push(interaction.user.id);
   saveData();
 
@@ -274,6 +286,11 @@ async function startApplication(interaction) {
       allowedMentions: { roles: isConfigured(CONFIG.ROLES.APPLICATION_REVIEWER) ? [CONFIG.ROLES.APPLICATION_REVIEWER] : [] },
     });
 
+    if (!data.pendingApplications.includes(interaction.user.id)) {
+      data.pendingApplications.push(interaction.user.id);
+      saveData();
+    }
+
     await dmChannel.send({
       embeds: [panelEmbed('تم استلام تقديمك', 'تقديمك الآن قيد المراجعة. سيتم إرسال النتيجة لك هنا عند اتخاذ القرار.', CONFIG.COLORS.SUCCESS)],
     });
@@ -292,23 +309,35 @@ async function startApplication(interaction) {
 }
 
 async function acceptWritten(interaction, applicantId) {
-  const guild = interaction.guild;
-  const member = await guild.members.fetch(applicantId).catch(() => null);
-  if (!member) return interaction.reply({ content: 'العضو غير موجود في السيرفر.', ephemeral: true });
-
-  if (isConfigured(CONFIG.ROLES.TEXT_ACCEPTED)) {
-    await member.roles.add(CONFIG.ROLES.TEXT_ACCEPTED, `قبول التقديم بواسطة ${interaction.user.tag}`);
+  if (!beginReview(interaction.message.id)) {
+    return interaction.reply({ content: 'جاري تنفيذ قرار آخر على هذا التقديم.', ephemeral: true });
   }
+  await interaction.deferUpdate();
+  try {
+    const member = await interaction.guild.members.fetch(applicantId).catch(() => null);
+    if (!member) return interaction.followUp({ content: 'العضو غير موجود في السيرفر.', ephemeral: true });
 
-  await interaction.update({ components: disableRows(interaction.message) });
-  await interaction.followUp({ content: `تم قبول ${member} في التقديم الكتابي بواسطة ${interaction.user}.`, ephemeral: false });
-  await safeDM(member.user, {
-    embeds: [panelEmbed(
-      'تم قبول تقديمك الكتابي ✅',
-      `مبروك! تم قبولك مبدئيًا في إدارة **${CONFIG.SERVER_NAME}**. بقيت لك المقابلة الصوتية؛ توجّه إلى <#${CONFIG.CHANNELS.INTERVIEW_WAITING}> وانتظر تعليمات الإدارة.`,
-      CONFIG.COLORS.SUCCESS
-    )],
-  });
+    if (isConfigured(CONFIG.ROLES.TEXT_ACCEPTED)) {
+      await member.roles.add(CONFIG.ROLES.TEXT_ACCEPTED, `قبول التقديم بواسطة ${interaction.user.tag}`);
+    }
+
+    data.pendingApplications = data.pendingApplications.filter(id => id !== applicantId);
+    saveData();
+    await interaction.message.edit({
+      embeds: reviewedEmbeds(interaction.message, 'مقبول', interaction.user),
+      components: [],
+    });
+    await interaction.followUp({ content: `تم قبول ${member} ومنحه رول المقبول.`, ephemeral: true });
+    await safeDM(member.user, {
+      embeds: [panelEmbed(
+        'تم قبول تقديمك الكتابي ✅',
+        `مبروك! تم قبولك مبدئيًا في إدارة **${CONFIG.SERVER_NAME}**. بقيت لك المقابلة الصوتية؛ توجّه إلى <#${CONFIG.CHANNELS.INTERVIEW_WAITING}> وانتظر تعليمات الإدارة.`,
+        CONFIG.COLORS.SUCCESS
+      )],
+    });
+  } finally {
+    processingReviews.delete(interaction.message.id);
+  }
 }
 
 function rejectModal(prefix, applicantId) {
@@ -327,25 +356,37 @@ function rejectModal(prefix, applicantId) {
 }
 
 async function finishReject(interaction, applicantId, stage) {
-  const reason = interaction.fields.getTextInputValue('reason');
-  const member = await interaction.guild.members.fetch(applicantId).catch(() => null);
-  const user = member?.user || await client.users.fetch(applicantId).catch(() => null);
-
-  const title = stage === 'voice' ? 'نتيجة المقابلة الصوتية' : 'نتيجة التقديم الإداري';
-  if (user) {
-    await safeDM(user, {
-      embeds: [panelEmbed(
-        `${title} ❌`,
-        `نأسف، لم يتم قبولك في هذه المرحلة.\n\n**السبب:**\n${reason}\n\nنتمنى لك التوفيق.`,
-        CONFIG.COLORS.DANGER
-      )],
-    });
+  if (!beginReview(interaction.message.id)) {
+    return interaction.reply({ content: 'جاري تنفيذ قرار آخر على هذا التقديم.', ephemeral: true });
   }
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    const reason = interaction.fields.getTextInputValue('reason');
+    const member = await interaction.guild.members.fetch(applicantId).catch(() => null);
+    const user = member?.user || await client.users.fetch(applicantId).catch(() => null);
+    const title = stage === 'voice' ? 'نتيجة المقابلة الصوتية' : 'نتيجة التقديم الإداري';
 
-  await interaction.reply({ content: `تم رفض <@${applicantId}> وإرسال السبب في الخاص.\n**السبب:** ${reason}` });
+    if (user) {
+      await safeDM(user, {
+        embeds: [panelEmbed(
+          `${title} ❌`,
+          `نأسف، لم يتم قبولك في هذه المرحلة.\n\n**السبب:**\n${reason}\n\nنتمنى لك التوفيق.`,
+          CONFIG.COLORS.DANGER
+        )],
+      });
+    }
 
-  if (interaction.message) {
-    await interaction.message.edit({ components: disableRows(interaction.message) }).catch(() => {});
+    if (stage === 'voice') data.pendingVoiceApplicants = data.pendingVoiceApplicants.filter(id => id !== applicantId);
+    else data.pendingApplications = data.pendingApplications.filter(id => id !== applicantId);
+    saveData();
+
+    await interaction.message.edit({
+      embeds: reviewedEmbeds(interaction.message, 'مرفوض', interaction.user, reason),
+      components: [],
+    }).catch(() => {});
+    await interaction.editReply({ content: `تم رفض <@${applicantId}> وإرسال السبب في الخاص.` });
+  } finally {
+    processingReviews.delete(interaction.message.id);
   }
 }
 
@@ -365,29 +406,56 @@ function voiceApplicantIdModal() {
     ));
 }
 
+function reviewedEmbeds(message, status, reviewer, reason = null) {
+  return message.embeds.map((oldEmbed, index) => {
+    const embed = EmbedBuilder.from(oldEmbed);
+    if (index === 0) {
+      embed.setColor(status === 'مقبول' ? CONFIG.COLORS.SUCCESS : CONFIG.COLORS.DANGER);
+      embed.addFields(
+        { name: 'الحالة', value: status === 'مقبول' ? '✅ مقبول' : '❌ مرفوض', inline: true },
+        { name: 'تمت المراجعة بواسطة', value: `${reviewer}`, inline: true },
+      );
+      if (reason) embed.addFields({ name: 'سبب الرفض', value: reason.slice(0, 1024) });
+      embed.setFooter({ text: `${CONFIG.SERVER_NAME} • تمت المراجعة` }).setTimestamp();
+    }
+    return embed;
+  });
+}
+
+function beginReview(messageId) {
+  if (processingReviews.has(messageId)) return false;
+  processingReviews.add(messageId);
+  return true;
+}
+
 async function registerVoiceById(interaction) {
+  await interaction.deferReply({ ephemeral: true });
   const applicantId = interaction.fields.getTextInputValue('applicant_id').trim();
 
   if (!/^\d{17,20}$/.test(applicantId)) {
-    return interaction.reply({ content: 'الآيدي غير صحيح. اكتب آيدي ديسكورد أرقام فقط.', ephemeral: true });
+    return interaction.editReply({ content: 'الآيدي غير صحيح. اكتب آيدي ديسكورد أرقام فقط.' });
   }
 
   const member = await interaction.guild.members.fetch(applicantId).catch(() => null);
   if (!member) {
-    return interaction.reply({ content: 'لم أجد هذا الشخص داخل السيرفر. تأكد من الآيدي.', ephemeral: true });
+    return interaction.editReply({ content: 'لم أجد هذا الشخص داخل السيرفر. تأكد من الآيدي.' });
   }
 
   if (member.user.bot) {
-    return interaction.reply({ content: 'لا يمكن تسجيل بوت في المقابلة الصوتية.', ephemeral: true });
+    return interaction.editReply({ content: 'لا يمكن تسجيل بوت في المقابلة الصوتية.' });
   }
 
   if (isConfigured(CONFIG.ROLES.ENTRY_PERMIT) && member.roles.cache.has(CONFIG.ROLES.ENTRY_PERMIT)) {
-    return interaction.reply({ content: 'هذا الشخص لديه رول تصريح الدخول بالفعل.', ephemeral: true });
+    return interaction.editReply({ content: 'هذا الشخص لديه رول تصريح الدخول بالفعل.' });
+  }
+
+  if (data.pendingVoiceApplicants.includes(applicantId)) {
+    return interaction.editReply({ content: 'هذا الشخص لديه تقديم صوتي قيد المراجعة بالفعل.' });
   }
 
   const reviewChannel = await client.channels.fetch(CONFIG.CHANNELS.VOICE_REVIEW).catch(() => null);
   if (!reviewChannel?.isTextBased()) {
-    return interaction.reply({ content: 'روم مراجعة التقديم الصوتي غير مضبوط.', ephemeral: true });
+    return interaction.editReply({ content: 'روم مراجعة التقديم الصوتي غير مضبوط.' });
   }
 
   const dmSent = await safeDM(member.user, {
@@ -413,29 +481,44 @@ async function registerVoiceById(interaction) {
     },
   });
 
-  return interaction.reply({
+  data.pendingVoiceApplicants.push(applicantId);
+  saveData();
+
+  return interaction.editReply({
     content: `تم تسجيل التقديم الصوتي لـ ${member} وإرساله إلى روم المراجعة.${dmSent ? '\nتم إبلاغه في الخاص.' : '\nتعذر إرسال الخاص له لأن رسائله مغلقة.'}`,
-    ephemeral: true,
   });
 }
 
 async function acceptVoice(interaction, applicantId) {
-  const member = await interaction.guild.members.fetch(applicantId).catch(() => null);
-  if (!member) return interaction.reply({ content: 'العضو غير موجود في السيرفر.', ephemeral: true });
-
-  if (isConfigured(CONFIG.ROLES.ENTRY_PERMIT)) {
-    await member.roles.add(CONFIG.ROLES.ENTRY_PERMIT, `اجتاز المقابلة الصوتية بواسطة ${interaction.user.tag}`);
+  if (!beginReview(interaction.message.id)) {
+    return interaction.reply({ content: 'جاري تنفيذ قرار آخر على هذا التقديم.', ephemeral: true });
   }
+  await interaction.deferUpdate();
+  try {
+    const member = await interaction.guild.members.fetch(applicantId).catch(() => null);
+    if (!member) return interaction.followUp({ content: 'العضو غير موجود في السيرفر.', ephemeral: true });
 
-  await interaction.update({ components: disableRows(interaction.message) });
-  await interaction.followUp({ content: `تم قبول ${member} في المقابلة الصوتية ومنحه تصريح الدخول.` });
-  await safeDM(member.user, {
-    embeds: [panelEmbed(
-      'تم قبولك في المقابلة الصوتية ✅',
-      `مبروك! اجتزت جميع مراحل التقديم في **${CONFIG.SERVER_NAME}** وتم منحك **رول تصريح الدخول**. نتمنى لك التوفيق معنا.`,
-      CONFIG.COLORS.SUCCESS
-    )],
-  });
+    if (isConfigured(CONFIG.ROLES.ENTRY_PERMIT)) {
+      await member.roles.add(CONFIG.ROLES.ENTRY_PERMIT, `اجتاز المقابلة الصوتية بواسطة ${interaction.user.tag}`);
+    }
+
+    data.pendingVoiceApplicants = data.pendingVoiceApplicants.filter(id => id !== applicantId);
+    saveData();
+    await interaction.message.edit({
+      embeds: reviewedEmbeds(interaction.message, 'مقبول', interaction.user),
+      components: [],
+    });
+    await interaction.followUp({ content: `تم قبول ${member} ومنحه تصريح الدخول.`, ephemeral: true });
+    await safeDM(member.user, {
+      embeds: [panelEmbed(
+        'تم قبولك في المقابلة الصوتية ✅',
+        `مبروك! اجتزت جميع مراحل التقديم في **${CONFIG.SERVER_NAME}** وتم منحك **رول تصريح الدخول**. نتمنى لك التوفيق معنا.`,
+        CONFIG.COLORS.SUCCESS
+      )],
+    });
+  } finally {
+    processingReviews.delete(interaction.message.id);
+  }
 }
 
 function controlRows() {
@@ -449,9 +532,18 @@ function controlRows() {
   ];
 }
 
+async function panelAlreadyExists(channel, customId) {
+  const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  if (!messages) return false;
+  return messages.some(message =>
+    message.author.id === client.user.id &&
+    message.components.some(row => row.components.some(component => component.customId === customId))
+  );
+}
+
 async function sendPanels() {
   const apply = await client.channels.fetch(CONFIG.CHANNELS.APPLY).catch(() => null);
-  if (apply?.isTextBased()) {
+  if (apply?.isTextBased() && !(await panelAlreadyExists(apply, 'start_application'))) {
     await apply.send({
       embeds: [panelEmbed(
         `التقديم على إدارة ${CONFIG.SERVER_NAME}`,
@@ -464,7 +556,7 @@ async function sendPanels() {
   }
 
   const voice = await client.channels.fetch(CONFIG.CHANNELS.VOICE_PANEL).catch(() => null);
-  if (voice?.isTextBased()) {
+  if (voice?.isTextBased() && !(await panelAlreadyExists(voice, 'add_voice_applicant'))) {
     await voice.send({
       embeds: [panelEmbed(
         'كنترول المقابلة الصوتية',
@@ -477,7 +569,7 @@ async function sendPanels() {
   }
 
   const control = await client.channels.fetch(CONFIG.CHANNELS.CONTROL).catch(() => null);
-  if (control?.isTextBased()) {
+  if (control?.isTextBased() && !(await panelAlreadyExists(control, 'control_open'))) {
     await control.send({
       embeds: [panelEmbed('كنترول التقديم', 'من هنا تستطيع فتح أو قفل التقديم وتحديد الرسالة التي تظهر للأعضاء عند الإغلاق.')],
       components: controlRows(),
