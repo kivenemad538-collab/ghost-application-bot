@@ -24,7 +24,7 @@ const CONFIG = {
   SERVER_NAME: 'Ghost',
 
   // صور مباشرة بصيغة PNG/JPG/WebP. اتركها فارغة لاستخدام بانر السيرفر.
-  SERVER_BANNER_URL: 'https://cdn.discordapp.com/attachments/1537192093901135892/1543744467784441976/ChatGPT_Image_Aug_9_2026_06_54_02_PM.png?ex=6a95fb92&is=6a94aa12&hm=7e438d7b870fc35e5112c5a70f8f2d88e6c69abea0fae975c6a772826ca16d48&',
+  SERVER_BANNER_URL: '',
 
   CHANNELS: {
     WELCOME: '1538611932624453783',
@@ -38,9 +38,12 @@ const CONFIG = {
   },
 
   ROLES: {
-    AUTO_MEMBER: '1535763946596728902',
+    AUTO_MEMBER_IDS: [
+      '1535763946596728902',
+      '1535767262580047923',
+    ],
     APPLICATION_REVIEWER: '1535755748297146398',
-    TEXT_ACCEPTED: '1535767262580047923',
+    TEXT_ACCEPTED: '1535798962462658651',
     ENTRY_PERMIT: '1535764584152043601',
   },
 
@@ -179,14 +182,28 @@ async function sendWelcome(member) {
   const channel = member.guild.channels.cache.get(CONFIG.CHANNELS.WELCOME);
   if (!channel?.isTextBased()) return;
 
+  const largeWelcomeImage = bannerFor(member.guild) || member.user.displayAvatarURL({ size: 1024, extension: 'png' });
+
   const embed = new EmbedBuilder()
     .setColor(CONFIG.COLORS.MAIN)
-    .setAuthor({ name: `مرحبًا بك في ${CONFIG.SERVER_NAME}`, iconURL: member.user.displayAvatarURL() })
-    .setTitle(`أهلًا ${member.user.username} 👋`)
-    .setDescription(`نورت **${CONFIG.SERVER_NAME}** يا ${member}. اقرأ القوانين ثم توجّه إلى التقديم، ونتمنى لك وقتًا ممتعًا معنا.`)
+    .setAuthor({
+      name: `${CONFIG.SERVER_NAME} • عضو جديد انضم إلينا`,
+      iconURL: member.guild.iconURL({ size: 256 }) || member.user.displayAvatarURL(),
+    })
+    .setTitle(`👋 مرحبًا بك في ${CONFIG.SERVER_NAME}`)
+    .setDescription(
+      `أهلًا وسهلًا بك يا ${member}\n\n` +
+      `نورت سيرفر **${CONFIG.SERVER_NAME}** ونتمنى لك تجربة ممتعة معنا. ` +
+      `يرجى قراءة القوانين أولًا، وبعدها يمكنك التوجه إلى روم التقديم من الأزرار الموجودة بالأسفل.\n\n` +
+      `**نتمنى لك وقتًا ممتعًا وسط عائلة Ghost 💙**`
+    )
+    .addFields(
+      { name: 'اسم العضو', value: member.user.username, inline: true },
+      { name: 'رقم العضو', value: `${member.guild.memberCount}`, inline: true },
+    )
     .setThumbnail(member.user.displayAvatarURL({ size: 512 }))
-    .setImage(bannerFor(member.guild))
-    .setFooter({ text: `العضو رقم ${member.guild.memberCount}` })
+    .setImage(largeWelcomeImage)
+    .setFooter({ text: `${CONFIG.SERVER_NAME} • سعداء بانضمامك إلينا` })
     .setTimestamp();
 
   const buttons = new ActionRowBuilder().addComponents(
@@ -312,13 +329,20 @@ async function acceptWritten(interaction, applicantId) {
   if (!beginReview(interaction.message.id)) {
     return interaction.reply({ content: 'جاري تنفيذ قرار آخر على هذا التقديم.', ephemeral: true });
   }
-  await interaction.deferUpdate();
+  await interaction.deferReply({ ephemeral: true });
   try {
     const member = await interaction.guild.members.fetch(applicantId).catch(() => null);
-    if (!member) return interaction.followUp({ content: 'العضو غير موجود في السيرفر.', ephemeral: true });
+    if (!member) return interaction.editReply({ content: 'العضو غير موجود في السيرفر.' });
 
     if (isConfigured(CONFIG.ROLES.TEXT_ACCEPTED)) {
-      await member.roles.add(CONFIG.ROLES.TEXT_ACCEPTED, `قبول التقديم بواسطة ${interaction.user.tag}`);
+      try {
+        await member.roles.add(CONFIG.ROLES.TEXT_ACCEPTED, `قبول التقديم بواسطة ${interaction.user.tag}`);
+      } catch (error) {
+        console.error('TEXT_ACCEPTED role error:', error);
+        return interaction.editReply({
+          content: 'تعذر منح رول المقبول. ارفع رول البوت فوق رول المقبول، وفعّل للبوت صلاحية **Manage Roles** ثم جرّب مرة أخرى.',
+        });
+      }
     }
 
     data.pendingApplications = data.pendingApplications.filter(id => id !== applicantId);
@@ -327,7 +351,7 @@ async function acceptWritten(interaction, applicantId) {
       embeds: reviewedEmbeds(interaction.message, 'مقبول', interaction.user),
       components: [],
     });
-    await interaction.followUp({ content: `تم قبول ${member} ومنحه رول المقبول.`, ephemeral: true });
+    await interaction.editReply({ content: `تم قبول ${member} ومنحه رول المقبول.` });
     await safeDM(member.user, {
       embeds: [panelEmbed(
         'تم قبول تقديمك الكتابي ✅',
@@ -493,13 +517,20 @@ async function acceptVoice(interaction, applicantId) {
   if (!beginReview(interaction.message.id)) {
     return interaction.reply({ content: 'جاري تنفيذ قرار آخر على هذا التقديم.', ephemeral: true });
   }
-  await interaction.deferUpdate();
+  await interaction.deferReply({ ephemeral: true });
   try {
     const member = await interaction.guild.members.fetch(applicantId).catch(() => null);
-    if (!member) return interaction.followUp({ content: 'العضو غير موجود في السيرفر.', ephemeral: true });
+    if (!member) return interaction.editReply({ content: 'العضو غير موجود في السيرفر.' });
 
     if (isConfigured(CONFIG.ROLES.ENTRY_PERMIT)) {
-      await member.roles.add(CONFIG.ROLES.ENTRY_PERMIT, `اجتاز المقابلة الصوتية بواسطة ${interaction.user.tag}`);
+      try {
+        await member.roles.add(CONFIG.ROLES.ENTRY_PERMIT, `اجتاز المقابلة الصوتية بواسطة ${interaction.user.tag}`);
+      } catch (error) {
+        console.error('ENTRY_PERMIT role error:', error);
+        return interaction.editReply({
+          content: 'تعذر منح رول تصريح الدخول. ارفع رول البوت فوق رول تصريح الدخول، وفعّل للبوت صلاحية **Manage Roles** ثم جرّب مرة أخرى.',
+        });
+      }
     }
 
     data.pendingVoiceApplicants = data.pendingVoiceApplicants.filter(id => id !== applicantId);
@@ -508,7 +539,7 @@ async function acceptVoice(interaction, applicantId) {
       embeds: reviewedEmbeds(interaction.message, 'مقبول', interaction.user),
       components: [],
     });
-    await interaction.followUp({ content: `تم قبول ${member} ومنحه تصريح الدخول.`, ephemeral: true });
+    await interaction.editReply({ content: `تم قبول ${member} ومنحه تصريح الدخول.` });
     await safeDM(member.user, {
       embeds: [panelEmbed(
         'تم قبولك في المقابلة الصوتية ✅',
@@ -584,7 +615,10 @@ client.once('ready', () => {
 
 client.on('guildMemberAdd', async member => {
   try {
-    if (isConfigured(CONFIG.ROLES.AUTO_MEMBER)) await member.roles.add(CONFIG.ROLES.AUTO_MEMBER);
+    const autoRoles = CONFIG.ROLES.AUTO_MEMBER_IDS.filter(isConfigured);
+    if (autoRoles.length) {
+      await member.roles.add(autoRoles, 'الرولات التلقائية عند دخول السيرفر');
+    }
     await sendWelcome(member);
   } catch (error) {
     console.error('Welcome error:', error);
