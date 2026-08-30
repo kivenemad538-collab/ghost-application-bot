@@ -24,7 +24,7 @@ const CONFIG = {
   SERVER_NAME: 'Ghost',
 
   // صور مباشرة بصيغة PNG/JPG/WebP. اتركها فارغة لاستخدام بانر السيرفر.
-  SERVER_BANNER_URL: '',
+  SERVER_BANNER_URL: 'https://cdn.discordapp.com/attachments/1537192093901135892/1543744467784441976/ChatGPT_Image_Aug_9_2026_06_54_02_PM.png?ex=6a95fb92&is=6a94aa12&hm=7e438d7b870fc35e5112c5a70f8f2d88e6c69abea0fae975c6a772826ca16d48&',
 
   CHANNELS: {
     WELCOME: '1538611932624453783',
